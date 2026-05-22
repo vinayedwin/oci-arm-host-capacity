@@ -1,0 +1,117 @@
+name: provision-arm-vm
+
+# Runs Hitrov's index.php every 5 minutes against the OCI REST API.
+# On a successful instance launch (script output contains "ocid1.instance"),
+# opens a GitHub issue — issue creation triggers GitHub's default email
+# notification to repo watchers (vinayedwin@gmail.com).
+#
+# Configured 2026-05-22 by chore/oracle-cloud-vm-setup after all 3
+# us-ashburn-1 ADs returned "Out of host capacity" — Always Free ARM
+# is famously rationed; this loop replaces a local nohup retry that
+# would die on machine reboot/sleep. Free GitHub Actions minutes for
+# public repos cover this indefinitely.
+#
+# Stop the loop after VM is up by editing this file: set `on: workflow_dispatch`
+# only (drop the schedule), then commit. Or just delete the file.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # every 5 minutes
+  workflow_dispatch:        # manual "Run workflow" button in Actions UI
+
+jobs:
+  attempt-launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP 8.2
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: curl, openssl, json
+
+      - name: Install composer dependencies
+        run: composer install --no-dev --no-interaction --prefer-dist
+
+      - name: Write OCI private key to file
+        run: |
+          mkdir -p .keys
+          printf '%s' "${{ secrets.OCI_PRIVATE_KEY }}" > .keys/oci_api_key.pem
+          chmod 600 .keys/oci_api_key.pem
+          # sanity check — first/last line should be PEM markers
+          head -1 .keys/oci_api_key.pem
+          tail -1 .keys/oci_api_key.pem
+
+      - name: Run launcher
+        id: launcher
+        env:
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_USER_ID: ${{ secrets.OCI_USER_ID }}
+          OCI_TENANCY_ID: ${{ secrets.OCI_TENANCY_ID }}
+          OCI_KEY_FINGERPRINT: ${{ secrets.OCI_KEY_FINGERPRINT }}
+          OCI_PRIVATE_KEY_FILENAME: ${{ github.workspace }}/.keys/oci_api_key.pem
+          OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+          OCI_IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+          OCI_OCPUS: '4'
+          OCI_MEMORY_IN_GBS: '24'
+          OCI_MAX_INSTANCES: '1'
+          # Loop all 3 ADs by leaving OCI_AVAILABILITY_DOMAIN unset
+        run: |
+          set +e
+          OUTPUT=$(php index.php 2>&1)
+          EXIT=$?
+          echo "=== launcher exit=$EXIT ==="
+          echo "$OUTPUT"
+          # Persist for the next step
+          {
+            echo 'output<<HITROV_EOF'
+            echo "$OUTPUT"
+            echo 'HITROV_EOF'
+          } >> "$GITHUB_OUTPUT"
+          # Always succeed at the step level; success vs capacity detected next step
+          exit 0
+
+      - name: Detect success — capacity hit and instance created
+        id: detect
+        run: |
+          OUTPUT=$(cat <<'HITROV_EOF'
+          ${{ steps.launcher.outputs.output }}
+          HITROV_EOF
+          )
+          if echo "$OUTPUT" | grep -q 'ocid1\.instance\.'; then
+            echo "captured=true" >> "$GITHUB_OUTPUT"
+            # Extract the instance OCID for the issue body
+            OCID=$(echo "$OUTPUT" | grep -oE 'ocid1\.instance\.[a-z0-9.-]+' | head -1)
+            echo "instance_ocid=$OCID" >> "$GITHUB_OUTPUT"
+            echo "=== SUCCESS: $OCID ==="
+          else
+            echo "captured=false" >> "$GITHUB_OUTPUT"
+            echo "(no instance OCID in output — still out of capacity)"
+          fi
+
+      - name: Open GitHub issue on success — triggers email notification
+        if: steps.detect.outputs.captured == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "ARM A1.Flex capacity hit — instance launched" \
+            --body "Hitrov launcher succeeded.
+
+          **Instance OCID:** \`${{ steps.detect.outputs.instance_ocid }}\`
+
+          Next steps (manual):
+          1. Get public IP from OCI Console → Compute → Instances → apprvl-services
+          2. \`ssh -i ~/.ssh/oracle_apprvl ubuntu@<PUBLIC_IP>\`
+          3. Resume \`chore/oracle-cloud-vm-setup\` Phase 2 (Docker + ONLYOFFICE)
+          4. **Disable this workflow** — edit \`.github/workflows/provision-arm-vm.yml\` and drop the \`schedule:\` line (or delete the file).
+
+          Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Note (no notification on capacity-still-blocked)
+        if: steps.detect.outputs.captured == 'false'
+        run: echo "Capacity not available this cycle. Next attempt in 5 min."
